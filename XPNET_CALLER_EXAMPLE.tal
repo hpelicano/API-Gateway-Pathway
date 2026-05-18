@@ -1,0 +1,155 @@
+!==============================================================
+!  Ejemplo de proceso XPNET caller en TAL
+!  Muestra cómo construir y enviar el mensaje IPC al
+!  PathwayProxyServer vía Pathsend / Guardian IPC.
+!
+!  NOTA: Esto es código TAL ilustrativo. El proceso XPNET real
+!  puede estar escrito en COBOL, TAL, C o incluso Java.
+!  El layout de buffer debe coincidir con MessageSerializer.java
+!==============================================================
+
+!--------------------------------------------------------------
+!  Definición del layout del buffer IPC de REQUEST
+!  (debe coincidir con MessageSerializer.java)
+!--------------------------------------------------------------
+
+STRUCT request_buffer(*);
+BEGIN
+    INT     version;          ! 2 bytes: siempre 1
+    INT     msg_type;         ! 2 bytes: 1=GET, 2=POST, 3=PUT, 4=DELETE
+    STRING  correlation_id[0:15];  ! 16 bytes: ID de correlación (ASCII)
+    STRING  operation[0:31];       ! 32 bytes: path de la API (ASCII)
+    INT     payload_length;        ! 2 bytes: longitud del payload JSON
+    STRING  payload[0:4031];       ! variable: body JSON (UTF-8)
+END;
+
+STRUCT response_buffer(*);
+BEGIN
+    INT     version;          ! 2 bytes
+    INT     http_status;      ! 2 bytes: código HTTP de la API externa
+    INT     error_code;       ! 2 bytes: 0=OK, >0=error del proxy
+    STRING  correlation_id[0:15];  ! 16 bytes
+    INT     payload_length;        ! 2 bytes
+    STRING  payload[0:4031];       ! variable: response JSON
+END;
+
+!--------------------------------------------------------------
+!  Proceso principal que envía un request vía IPC al Proxy Server
+!--------------------------------------------------------------
+
+PROC xpnet_send_to_proxy MAIN;
+
+BEGIN
+    INT     file_number;          ! file number del Proxy Server
+    INT     error;
+    INT     count_written;
+    INT     count_read;
+
+    STRUCT  req  LIKE request_buffer;
+    STRUCT  resp LIKE response_buffer;
+
+    STRING  server_process[0:24] := "$PROXYLM";  ! LINKMON del Pathway
+
+    !-- PASO 1: Abrir el proceso Pathway (LINKMON) --
+    CALL FILE_OPEN_(server_process,
+                    server_process'LENGTH,
+                    file_number,
+                    access := 2,       ! read/write
+                    exclusion := 0,    ! shared
+                    nowait_depth := 0, ! modo síncrono (bloqueante)
+                    sync_or_receive_depth := 1);
+
+    IF <> THEN
+    BEGIN
+        CALL PROCESS_STOP_(,,"Error abriendo $PROXYLM");
+    END;
+
+    !-- PASO 2: Construir el mensaje IPC request --
+    req.version         := 1;
+    req.msg_type        := 2;   ! HTTP POST
+
+    !  correlationId: ID único para rastrear este request end-to-end
+    req.correlation_id  := "XPNET-TXN-000123456";
+
+    !  operation: path relativo del API Gateway
+    req.operation       := "/payments/authorize";
+
+    !  payload: JSON body del request
+    req.payload[0]      := "{"
+                           """accountId"":""ACC-9876"","
+                           """amount"":15000,"
+                           """currency"":""ARS"","
+                           """type"":""DEBIT"""
+                           "}";
+    req.payload_length  := req.payload'LENGTH;  ! longitud real del JSON
+
+    !-- PASO 3: Enviar el mensaje IPC al Proxy Server (bloqueante) --
+    !   WRITEREAD: envía el buffer y espera la respuesta del server
+    !   Es el equivalente del SEND en Screen COBOL o PATHSEND en C.
+    CALL WRITEREAD(file_number,
+                   req,               ! buffer de request
+                   req'LENGTH,        ! bytes a enviar
+                   resp,              ! buffer de respuesta
+                   resp'LENGTH,       ! bytes máximos a recibir
+                   count_read);
+
+    IF <> THEN
+    BEGIN
+        CALL PROCESS_STOP_(,,"Error en WRITEREAD al Proxy Server");
+    END;
+
+    !-- PASO 4: Procesar la respuesta del Proxy Server --
+    IF resp.error_code = 0 THEN
+    BEGIN
+        !  Respuesta exitosa: resp.payload contiene el JSON de la API externa
+        !  resp.http_status contiene el código HTTP (200, 201, etc.)
+        CALL PROCESS_JSON_RESPONSE(resp.payload, resp.payload_length);
+    END
+    ELSE
+    BEGIN
+        !  Error del proxy: loggear y manejar según el error_code
+        !  Códigos de error definidos en IpcResponse.java:
+        !    1 = DESERIALIZE_ERROR
+        !    2 = API_ERROR
+        !    3 = API_TIMEOUT
+        !    4 = API_UNAVAILABLE
+        !    5 = EMPTY_MSG
+        !   99 = INTERNAL_ERROR
+        CALL HANDLE_PROXY_ERROR(resp.error_code, resp.http_status);
+    END;
+
+    !-- PASO 5: Cerrar el file del Pathway server --
+    CALL FILE_CLOSE_(file_number);
+
+END;  ! PROC xpnet_send_to_proxy
+
+
+!--------------------------------------------------------------
+!  Ejemplo alternativo usando PATHSEND (C API)
+!  Este es el mecanismo recomendado para aplicaciones modernas.
+!
+!  #include <cextdecs.h>
+!
+!  void xpnet_send_via_pathsend() {
+!      SPI_KEY_DEF  spi_key;
+!      short        error;
+!
+!      // Abrir el server Pathway
+!      error = SERVERCLASS_SEND_INFO_(&spi_key,
+!                                     "$PROXYM",    // PATHMON process name
+!                                     "PROXYSRV",   // SERVERCLASS name
+!                                     NULL, 0,
+!                                     NULL,
+!                                     30000);       // timeout en ms
+!
+!      // Enviar mensaje y esperar respuesta
+!      error = SERVERCLASS_SEND_(&spi_key,
+!                                req_buffer,  req_len,
+!                                resp_buffer, resp_len,
+!                                &resp_bytes_received,
+!                                0);
+!
+!      // Liberar recursos
+!      SERVERCLASS_SEND_INFO_UNRESERVE_(&spi_key);
+!  }
+!--------------------------------------------------------------

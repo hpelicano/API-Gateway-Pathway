@@ -1,0 +1,75 @@
+!==============================================================
+!  PATHCOM Configuration Script
+!  PathwayProxyServer - HPE NonStop / NSJ 17
+!==============================================================
+!
+!  Instrucciones de uso:
+!    1. Asegurarse de que proxy.jar está en $DATA.PROXYAPP
+!    2. Ejecutar desde TACL:
+!         PATHCOM $PROXYM
+!         OBEY $DATA.PROXYAPP.PATHCFG
+!
+!  Variables de entorno requeridas para el JAR:
+!    PROXY_API_BASE_URL  : URL base del API Gateway externo
+!    PROXY_API_KEY       : API Key de autenticación
+!
+!==============================================================
+
+!-- Crear el entorno PATHMON (si no existe) --
+ADD PATHMON $PROXYM, CPUS 0:1
+
+!--------------------------------------------------------------
+!  SERVER CLASS: PROXYSRV
+!  - Tipo JAVA para que PATHMON levante la JVM NSJ 17
+!  - MAXSERVERS: escalado horizontal bajo carga de XPNET
+!  - MINSERVERS: procesos pre-calentados esperando en $RECEIVE
+!  - TIMEOUT: segundos de inactividad antes de que PATHMON
+!             termine un server ocioso
+!--------------------------------------------------------------
+ADD SERVERCLASS PROXYSRV, &
+    PROGRAM $DATA.PROXYAPP.PROXYSRV, &
+    PROCESSTYPE JAVA, &
+    MAXSERVERS 10, &
+    MINSERVERS 2, &
+    TIMEOUT 120, &
+    MAXLINKS 50
+
+!-- JVM Home: NSJ 17 instalado en L-series (NonStop X) --
+SET SERVERCLASS PROXYSRV ENV "JREHOME=/usr/tandem/java17"
+
+!-- Classpath: JAR del proxy más JToolkit (tdmext.jar) --
+SET SERVERCLASS PROXYSRV ARGLIST &
+    "-cp /usr/tandem/java17/lib/tdmext.jar:/home/proxyuser/proxy.jar &
+     com.nonstop.proxy.PathwayProxyServer"
+
+!-- Variables de entorno de la aplicación --
+SET SERVERCLASS PROXYSRV ENV "PROXY_API_BASE_URL=https://api.mygateway.com/v1"
+SET SERVERCLASS PROXYSRV ENV "PROXY_API_KEY=mi-api-key-segura"
+SET SERVERCLASS PROXYSRV ENV "PROXY_CONNECT_TIMEOUT_MS=5000"
+SET SERVERCLASS PROXYSRV ENV "PROXY_REQUEST_TIMEOUT_MS=30000"
+SET SERVERCLASS PROXYSRV ENV "PROXY_DEBUG=false"
+
+!-- JVM flags: GC tuning para servidor de larga duración --
+SET SERVERCLASS PROXYSRV ENV &
+    "JAVA_OPTS=-Xms64m -Xmx256m -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+
+!--------------------------------------------------------------
+!  LINKMON: proceso de enlace para conexiones XPNET entrantes
+!  Los procesos XPNET enviarán sus mensajes IPC al LINKMON
+!  que los distribuye a los PROXYSRV disponibles.
+!--------------------------------------------------------------
+ADD LINKMON $PROXYLM, &
+    CPUS 0:1, &
+    MAXLINKS 500
+
+!--------------------------------------------------------------
+!  Iniciar el entorno PATHMON
+!--------------------------------------------------------------
+START PATHMON $PROXYM
+START SERVERCLASS PROXYSRV
+START LINKMON $PROXYLM
+
+!-- Verificar estado --
+STATUS SERVERCLASS PROXYSRV
+STATUS PATHMON $PROXYM
+STATUS LINKMON $PROXYLM
