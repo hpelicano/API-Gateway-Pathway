@@ -9,39 +9,53 @@ import com.nonstop.proxy.handler.ApiGatewayClient;
 import com.nonstop.proxy.handler.KeepAliveService;
 import com.nonstop.proxy.model.IpcRequest;
 import com.nonstop.proxy.model.IpcResponse;
+import com.nonstop.proxy.util.DdlLoader;
 import com.nonstop.proxy.util.Logger;
 import com.nonstop.proxy.util.MessageSerializer;
 
 /**
- * Servidor Pathway (NSJ 11+) que actúa de proxy entre procesos XPNET
- * y un API Gateway externo via HTTPS.
+ * Servidor Pathway (NSJ 11+) — proxy entre procesos XPNET y un API Gateway externo.
  *
- * Flujo por mensaje:
- *  1. Lee buffer binario desde $RECEIVE (JToolkit)
- *  2. Deserializa buffer → IpcRequest (MessageSerializer)
- *  3. Convierte IpcRequest → JSON → llamada HTTPS (ApiGatewayClient)
- *  4. Convierte respuesta JSON → IpcResponse → buffer binario (MessageSerializer)
- *  5. Envía buffer al proceso XPNET caller via Guardian REPLY
+ * Flujo completo por mensaje:
  *
- * Configuración en PATHCOM:
- *   ADD SERVERCLASS PROXYSRV, PROCESSTYPE JAVA, MAXSERVERS 10, MINSERVERS 2, TIMEOUT 120
+ *  [XPNET] buffer texto plano (key=value)
+ *      ↓  $RECEIVE (JToolkit)
+ *  [1] MessageSerializer.parseBuffer()
+ *      → lee metodo / endpoint / ddl_json del buffer
+ *      → carga DdlDefinition desde /home/proxyuser/ddl/<ddl_json>.json
+ *      → mapea campos de negocio → JSON según sección "request" de la DDL
+ *      → IpcRequest{method, endpoint, jsonPayload, ddl}
+ *      ↓
+ *  [2] ApiGatewayClient.call()
+ *      → HTTPS POST/GET/PUT/DELETE con el JSON construido
+ *      → IpcResponse{httpStatus, payload=jsonRespuesta}
+ *      ↓
+ *  [3] MessageSerializer.buildReplyBuffer()
+ *      → extrae valores del JSON de respuesta usando json_path de la DDL "response"
+ *      → arma buffer de longitud fija (PIC-like) con padding de cada campo
+ *      ↓
+ *  [XPNET] buffer respuesta de longitud fija vía Guardian REPLY
+ *
+ * Configuración PATHCOM (actualizada para JDK 11 + DDL):
  *   SET SERVERCLASS PROXYSRV ENV "JREHOME=/usr/tandem/java11"
+ *   SET SERVERCLASS PROXYSRV ENV "PROXY_DDL_PATH=/home/proxyuser/ddl"
  *   SET SERVERCLASS PROXYSRV ARGLIST "-cp /usr/tandem/java11/lib/tdmext.jar:/home/proxyuser/proxy.jar com.nonstop.proxy.PathwayProxyServer"
  */
 public class PathwayProxyServer {
 
-    private static final int MAX_MSG_SIZE   = 4096;
+    private static final int MAX_MSG_SIZE    = 32768; // 32KB — suficiente para mensajes COBOL/texto
     private static final int MAX_API_RETRIES = 3;
 
     private final ApiGatewayClient apiClient;
     private final KeepAliveService keepAlive;
+    private final DdlLoader        ddlLoader;
     private final Logger           logger;
     private volatile boolean       running = true;
 
     public PathwayProxyServer() {
         this.logger    = new Logger("PathwayProxyServer");
+        this.ddlLoader = new DdlLoader();
         this.apiClient = new ApiGatewayClient();
-        // KeepAlive reutiliza el HttpClient del apiClient (pool TLS compartido)
         this.keepAlive = new KeepAliveService(
             apiClient.getHttpClient(),
             apiClient.getBaseUrl(),
@@ -58,7 +72,8 @@ public class PathwayProxyServer {
     //  Loop principal del servidor
     // ----------------------------------------------------------
     public void run() {
-        logger.info("PathwayProxyServer iniciado (JDK 11, TLS 1.2/1.3). Esperando mensajes...");
+        logger.info("PathwayProxyServer iniciado (JDK 11, TLS 1.2/1.3, DDL-driven). "
+            + "DDL path: " + System.getenv().getOrDefault("PROXY_DDL_PATH", "ddl"));
 
         keepAlive.start();
 
@@ -74,7 +89,7 @@ public class PathwayProxyServer {
             if (Thread.currentThread().isInterrupted()) {
                 logger.info("PathwayProxyServer interrumpido. Cerrando...");
             } else {
-                logger.error("Error fatal al operar $RECEIVE: " + e.getMessage());
+                logger.error("Error fatal en $RECEIVE: " + e.getMessage());
                 System.exit(1);
             }
         } finally {
@@ -90,54 +105,61 @@ public class PathwayProxyServer {
     private void processNextMessage(Receive receive) {
         byte[]      rawBuffer = new byte[MAX_MSG_SIZE];
         ReceiveInfo info      = new ReceiveInfo();
+        IpcRequest  request   = null;
 
         try {
-            // PASO 1: Leer buffer binario desde $RECEIVE (bloqueante)
+            // ── PASO 1: Leer buffer de texto plano desde $RECEIVE ─────────────
             int bytesRead = receive.read(rawBuffer, MAX_MSG_SIZE, info);
 
             if (bytesRead <= 0) {
                 logger.warn("Mensaje vacío o de sistema. Ignorando.");
-                sendErrorReply(receive, IpcResponse.ERR_EMPTY_MSG, "EMPTY_MSG");
+                sendErrorReply(receive, null, "E000", "Mensaje IPC vacío");
                 return;
             }
 
-            logger.info(String.format("Mensaje recibido: %d bytes, filenum=%d, syncId=%d",
-                bytesRead, info.getFileNumber(), info.getSyncId()));
+            logger.info(String.format("Mensaje recibido: %d bytes, filenum=%d",
+                bytesRead, info.getFileNumber()));
 
-            // PASO 2: Deserializar buffer binario → IpcRequest (big-endian)
-            //         El payload del buffer XPNET ya viene como JSON UTF-8
-            IpcRequest request = MessageSerializer.deserialize(rawBuffer, bytesRead);
-            logger.info("Request: op=" + request.getOperation()
-                + ", method=" + request.getHttpMethod()
-                + ", corrId=" + request.getCorrelationId());
+            // ── PASO 2: Parsear buffer key=value + cargar DDL + armar JSON ────
+            //   MessageSerializer lee metodo/endpoint/ddl_json del buffer,
+            //   carga la DdlDefinition y construye el JSON para la API.
+            request = MessageSerializer.parseBuffer(rawBuffer, bytesRead, ddlLoader);
 
-            // PASO 3 + 4: Llamar API externa (con reintentos) y obtener IpcResponse
-            //             ApiGatewayClient convierte IpcRequest → JSON → HTTPS
-            //             y la respuesta JSON de la API → IpcResponse
+            logger.info("Request: " + request);
+
+            // ── PASO 3: Llamar API Gateway con reintentos ─────────────────────
             IpcResponse apiResponse = callWithRetry(request);
 
-            // PASO 5: Serializar IpcResponse → buffer binario → Guardian REPLY al XPNET
-            byte[] replyBuffer = MessageSerializer.serialize(apiResponse);
+            // ── PASO 4: Convertir JSON de respuesta → buffer de longitud fija ─
+            //   MessageSerializer usa la sección "response" de la DDL para
+            //   extraer cada campo del JSON y armar el buffer con padding COBOL.
+            byte[] replyBuffer = MessageSerializer.buildReplyBuffer(
+                apiResponse.getPayload(), request);
+
+            // ── PASO 5: Guardian REPLY al proceso XPNET ───────────────────────
             receive.reply(replyBuffer, replyBuffer.length, (short) 0);
 
-            logger.info("Reply enviado. corrId=" + request.getCorrelationId()
-                + ", httpStatus=" + apiResponse.getHttpStatusCode()
-                + ", replyBytes=" + replyBuffer.length);
+            logger.info(String.format("Reply enviado. corrId=%s, httpStatus=%d, replyBytes=%d",
+                request.getCorrelationId(), apiResponse.getHttpStatusCode(), replyBuffer.length));
 
-        } catch (MessageSerializer.DeserializationException e) {
-            logger.error("Error deserializando buffer IPC: " + e.getMessage());
-            sendErrorReply(receive, IpcResponse.ERR_DESERIALIZE, "DESERIALIZE_ERROR");
+        } catch (MessageSerializer.ParseException e) {
+            logger.error("Error parseando buffer IPC: " + e.getMessage());
+            sendErrorReply(receive, request, "E001", e.getMessage());
+
+        } catch (DdlLoader.DdlNotFoundException e) {
+            logger.error("DDL no encontrada: " + e.getMessage());
+            sendErrorReply(receive, request, "E002", "DDL no encontrada: "
+                + (request != null ? request.getDdlName() : "desconocida"));
 
         } catch (ApiGatewayClient.ApiException e) {
-            logger.error("Error llamando API externa: " + e.getMessage()
-                + " (HTTP " + e.getHttpStatus() + ")");
-            String key = e.getHttpStatus() == 0 ? "API_TIMEOUT" : "API_ERROR:" + e.getHttpStatus();
-            sendErrorReply(receive, IpcResponse.ERR_API_ERROR, key);
+            logger.error("Error API externa: " + e.getMessage()
+                + " HTTP=" + e.getHttpStatus());
+            String code = e.getHttpStatus() == 0 ? "E003" : "E" + e.getHttpStatus();
+            sendErrorReply(receive, request, code, e.getMessage());
 
         } catch (GuardianException e) {
-            // Error en la propia operación Guardian (read o reply)
             if (Thread.currentThread().isInterrupted()) {
-                running = false; // salir del while loop
+                running = false;
             } else {
                 logger.error("Error Guardian: " + e.getMessage());
             }
@@ -151,51 +173,42 @@ public class PathwayProxyServer {
             throws ApiGatewayClient.ApiException {
 
         ApiGatewayClient.ApiException last = null;
-
         for (int attempt = 1; attempt <= MAX_API_RETRIES; attempt++) {
             try {
-                logger.info("API call intento " + attempt + "/" + MAX_API_RETRIES);
+                logger.info("API call intento " + attempt + "/" + MAX_API_RETRIES
+                    + " → " + request.getMethod() + " " + request.getEndpoint());
                 return apiClient.call(request);
-
             } catch (ApiGatewayClient.ApiException e) {
                 last = e;
                 if (!e.isRetryable()) throw e;
-                logger.warn("Intento " + attempt + " falló: " + e.getMessage() + ". Reintentando...");
-                sleep(exponentialBackoffMs(attempt));
+                logger.warn("Intento " + attempt + " falló: " + e.getMessage());
+                sleep(Math.min((long) Math.pow(2, attempt) * 200L, 5000L));
             }
         }
-
         throw last;
     }
 
     // ----------------------------------------------------------
     //  Helpers
     // ----------------------------------------------------------
-    private void sendErrorReply(Receive receive, short errorCode, String errorKey) {
+    private void sendErrorReply(Receive receive, IpcRequest request,
+                                 String errorCode, String errorMsg) {
         try {
-            IpcResponse err = IpcResponse.error(errorKey);
-            byte[] buf = MessageSerializer.serialize(err);
+            byte[] buf = MessageSerializer.buildErrorBuffer(errorCode, errorMsg, request);
             receive.reply(buf, buf.length, (short) -1);
         } catch (Exception ex) {
             logger.error("No se pudo enviar error reply: " + ex.getMessage());
         }
     }
 
-    private static long exponentialBackoffMs(int attempt) {
-        return Math.min((long) Math.pow(2, attempt) * 200L, 5000L);
-    }
-
     private static void sleep(long ms) {
-        try {
-            Thread.sleep(ms);
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-        }
+        try { Thread.sleep(ms); }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
 
     private void registerShutdownHook() {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            logger.info("Señal de shutdown recibida. Deteniendo PathwayProxyServer...");
+            logger.info("Shutdown recibido. Deteniendo PathwayProxyServer...");
             running = false;
         }, "shutdown-hook"));
     }

@@ -1,0 +1,18 @@
+{
+  "ddl_name":    "alta_cliente",
+  "description": "Alta de nuevo cliente persona física",
+
+  "request": [
+    { "field": "nombre",   "length": 40, "type": "string",  "json_path": "nombre"            },
+    { "field": "apellido", "length": 40, "type": "string",  "json_path": "apellido"          },
+    { "field": "dni",      "length": 11, "type": "string",  "json_path": "documento.numero"  },
+    { "field": "email",    "length": 80, "type": "string",  "json_path": "email"             },
+    { "field": "telefono", "length": 20, "type": "string",  "json_path": "contacto.telefono" }
+  ],
+
+  "response": [
+    { "field": "cod_ret",    "length":  4, "type": "numeric", "json_path": "codigo"          },
+    { "field": "id_cliente", "length": 10, "type": "numeric", "json_path": "data.id_cliente" },
+    { "field": "mensaje",    "length": 80, "type": "string",  "json_path": "mensaje"         }
+  ]
+}

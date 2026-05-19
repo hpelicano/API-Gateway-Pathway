@@ -1,0 +1,20 @@
+{
+  "ddl_name":    "transferencia",
+  "description": "Transferencia bancaria entre cuentas",
+
+  "request": [
+    { "field": "cta_origen",  "length": 16, "type": "string",  "json_path": "origen.cuenta"   },
+    { "field": "cta_destino", "length": 16, "type": "string",  "json_path": "destino.cuenta"  },
+    { "field": "importe",     "length": 15, "type": "numeric", "json_path": "importe"          },
+    { "field": "moneda",      "length":  3, "type": "string",  "json_path": "moneda"           },
+    { "field": "referencia",  "length": 20, "type": "string",  "json_path": "referencia"       }
+  ],
+
+  "response": [
+    { "field": "cod_ret",    "length":  4, "type": "numeric", "json_path": "codigo"              },
+    { "field": "nro_op",     "length": 12, "type": "numeric", "json_path": "data.nro_operacion"  },
+    { "field": "estado",     "length":  2, "type": "string",  "json_path": "data.estado"         },
+    { "field": "fecha_hora", "length": 14, "type": "string",  "json_path": "data.fecha_hora"     },
+    { "field": "mensaje",    "length": 80, "type": "string",  "json_path": "mensaje"             }
+  ]
+}

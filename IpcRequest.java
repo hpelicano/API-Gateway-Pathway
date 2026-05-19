@@ -1,64 +1,69 @@
 package com.nonstop.proxy.model;
 
+import java.util.Collections;
+import java.util.Map;
+
 /**
- * Mensaje IPC recibido desde un proceso XPNET a través de $RECEIVE.
+ * Mensaje IPC recibido desde un proceso XPNET, ya parseado desde el buffer de texto plano.
  *
- * Layout del buffer binario (big-endian):
- *  Offset  Bytes  Campo
- *  0       2      version       (short, = 1)
- *  2       2      msgType       (1=GET 2=POST 3=PUT 4=DELETE)
- *  4       16     correlationId (ASCII, padded)
- *  20      32     operation     (path del API, ASCII, padded)
- *  52      2      payloadLength (short)
- *  54      var    payload       (UTF-8 JSON)
+ * El buffer de entrada desde $RECEIVE es texto plano key=value, un par por línea:
+ *
+ *   metodo=POST
+ *   endpoint=/service/alta_cliente
+ *   ddl_json=alta_cliente
+ *   nombre=Juan
+ *   apellido=Pérez
+ *   dni=20345678901
+ *   email=juan@banco.com
+ *
+ * Los tres primeros campos (metodo, endpoint, ddl_json) son de control del servidor.
+ * El resto son datos de negocio que se mapean al JSON según la DDL correspondiente.
+ *
+ * MessageSerializer.parseBuffer() construye esta instancia y adjunta:
+ *   - La DDL cargada desde disco
+ *   - El JSON de payload ya armado para enviar a la API externa
  */
 public class IpcRequest {
 
-    public static final short MSG_TYPE_HTTP_GET    = 0x01;
-    public static final short MSG_TYPE_HTTP_POST   = 0x02;
-    public static final short MSG_TYPE_HTTP_PUT    = 0x03;
-    public static final short MSG_TYPE_HTTP_DELETE = 0x04;
+    private final String              method;         // GET, POST, PUT, DELETE
+    private final String              endpoint;       // path del API Gateway
+    private final String              ddlName;        // nombre del archivo DDL (sin .json)
+    private final String              correlationId;  // generado o tomado del buffer
+    private final Map<String, String> dataFields;     // campos de negocio del buffer
+    private final String              jsonPayload;    // JSON armado con dataFields + DDL request
+    private final DdlDefinition       ddl;            // DDL cargada desde disco
 
-    private final short  version;
-    private final short  msgType;
-    private final String correlationId;
-    private final String operation;
-    private final String payload;
-
-    public IpcRequest(short version, short msgType,
-                      String correlationId, String operation, String payload) {
-        this.version       = version;
-        this.msgType       = msgType;
+    public IpcRequest(String method, String endpoint, String ddlName,
+                      String correlationId, Map<String, String> dataFields,
+                      String jsonPayload, DdlDefinition ddl) {
+        this.method        = method;
+        this.endpoint      = endpoint;
+        this.ddlName       = ddlName;
         this.correlationId = correlationId;
-        this.operation     = operation;
-        this.payload       = payload;
+        this.dataFields    = Collections.unmodifiableMap(dataFields);
+        this.jsonPayload   = jsonPayload;
+        this.ddl           = ddl;
     }
 
-    public short  getVersion()       { return version; }
-    public short  getMsgType()       { return msgType; }
-    public String getCorrelationId() { return correlationId; }
-    public String getOperation()     { return operation; }
-    public String getPayload()       { return payload; }
+    public String              getMethod()        { return method; }
+    public String              getEndpoint()      { return endpoint; }
+    public String              getDdlName()       { return ddlName; }
+    public String              getCorrelationId() { return correlationId; }
+    public Map<String, String> getDataFields()    { return dataFields; }
+    public String              getJsonPayload()   { return jsonPayload; }
+    public DdlDefinition       getDdl()           { return ddl; }
 
-    public boolean isGet()    { return msgType == MSG_TYPE_HTTP_GET; }
-    public boolean isPost()   { return msgType == MSG_TYPE_HTTP_POST; }
-    public boolean isPut()    { return msgType == MSG_TYPE_HTTP_PUT; }
-    public boolean isDelete() { return msgType == MSG_TYPE_HTTP_DELETE; }
-
-    /** Devuelve el método HTTP correspondiente al msgType. Compatible JDK 11. */
-    public String getHttpMethod() {
-        if (msgType == MSG_TYPE_HTTP_GET)    return "GET";
-        if (msgType == MSG_TYPE_HTTP_POST)   return "POST";
-        if (msgType == MSG_TYPE_HTTP_PUT)    return "PUT";
-        if (msgType == MSG_TYPE_HTTP_DELETE) return "DELETE";
-        throw new IllegalStateException("msgType desconocido: " + msgType);
-    }
+    // Mantiene compatibilidad con ApiGatewayClient que usa getHttpMethod() y getPayload()
+    public String getHttpMethod() { return method; }
+    public String getPayload()    { return jsonPayload; }
+    public String getOperation()  { return endpoint; }
 
     @Override
     public String toString() {
         return String.format(
-            "IpcRequest{version=%d, msgType=%d, correlationId='%s', operation='%s', payloadLen=%d}",
-            version, msgType, correlationId, operation,
-            payload != null ? payload.length() : 0);
+            "IpcRequest{method='%s', endpoint='%s', ddl='%s', corrId='%s', fields=%d, payloadLen=%d}",
+            method, endpoint, ddlName, correlationId,
+            dataFields != null ? dataFields.size() : 0,
+            jsonPayload != null ? jsonPayload.length() : 0);
     }
 }

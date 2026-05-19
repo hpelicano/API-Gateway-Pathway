@@ -1,167 +1,376 @@
 package com.nonstop.proxy.util;
 
+import com.nonstop.proxy.model.DdlDefinition;
+import com.nonstop.proxy.model.DdlField;
 import com.nonstop.proxy.model.IpcRequest;
-import com.nonstop.proxy.model.IpcResponse;
 
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * ============================================================
- *  MessageSerializer
- * ============================================================
- *  Serializa y deserializa los buffers binarios IPC que viajan
- *  entre el proceso XPNET (caller) y el Pathway Proxy Server.
+ * Responsable de la traducción completa entre el buffer IPC de texto plano
+ * y los mensajes JSON que viajan hacia/desde el API Gateway externo.
  *
- *  IMPORTANTE: El layout binario debe coincidir exactamente con
- *  el que define el proceso XPNET en TAL/COBOL/C.
- *  Se usa big-endian (network byte order) por convención NonStop.
- * ============================================================
+ * ─── Flujo Request (buffer IPC → JSON) ───────────────────────────────────
+ *
+ *  Buffer de entrada (texto plano, key=value por línea):
+ *    metodo=POST
+ *    endpoint=/service/alta_cliente
+ *    ddl_json=alta_cliente
+ *    nombre=Juan
+ *    apellido=Pérez
+ *    dni=20345678901
+ *
+ *  Usando la sección "request" de la DDL, produce JSON para la API:
+ *    { "nombre":"Juan", "apellido":"Pérez", "documento":{"numero":"20345678901"} }
+ *    (el json_path "documento.numero" indica anidamiento en el JSON de salida)
+ *
+ * ─── Flujo Response (JSON API → buffer IPC) ──────────────────────────────
+ *
+ *  Respuesta JSON de la API externa:
+ *    { "codigo": 0, "mensaje": "OK", "data": { "id_cliente": 99, "estado": "AC" } }
+ *
+ *  Usando la sección "response" de la DDL, produce buffer de longitud fija:
+ *    0000ALTA OK                                                              ...0000000099AC
+ *    ├──┤├───────────────────────────────────────────────────────────────────┤├─────────┤├──┤
+ *    4    100 chars (mensaje)                                                 10          2
+ *
+ * ─── Padding ─────────────────────────────────────────────────────────────
+ *  type="string"  → alineado izquierda, padded con espacios a la derecha
+ *  type="numeric" → alineado derecha, padded con ceros a la izquierda
  */
 public class MessageSerializer {
 
-    // Offsets del buffer de REQUEST (ver IpcRequest)
-    private static final int REQ_OFFSET_VERSION       = 0;   // 2 bytes
-    private static final int REQ_OFFSET_MSGTYPE       = 2;   // 2 bytes
-    private static final int REQ_OFFSET_CORRELATION   = 4;   // 16 bytes
-    private static final int REQ_OFFSET_OPERATION     = 20;  // 32 bytes
-    private static final int REQ_OFFSET_PAYLOAD_LEN   = 52;  // 2 bytes
-    private static final int REQ_OFFSET_PAYLOAD       = 54;  // variable
-
-    private static final int REQ_CORRELATION_LEN      = 16;
-    private static final int REQ_OPERATION_LEN        = 32;
-
-    // Offsets del buffer de RESPONSE (ver IpcResponse)
-    private static final int RES_OFFSET_VERSION       = 0;   // 2 bytes
-    private static final int RES_OFFSET_STATUSCODE    = 2;   // 2 bytes
-    private static final int RES_OFFSET_ERRORCODE     = 4;   // 2 bytes
-    private static final int RES_OFFSET_CORRELATION   = 6;   // 16 bytes
-    private static final int RES_OFFSET_PAYLOAD_LEN   = 22;  // 2 bytes
-    private static final int RES_OFFSET_PAYLOAD       = 24;  // variable
-
-    private static final int RES_CORRELATION_LEN      = 16;
-    private static final int RES_HEADER_SIZE          = 24;
-
     // ----------------------------------------------------------
-    //  Deserialización: buffer binario → IpcRequest
+    //  API pública
     // ----------------------------------------------------------
+
     /**
-     * Convierte el buffer binario recibido de $RECEIVE en un IpcRequest.
+     * Parsea el buffer de texto plano key=value recibido desde $RECEIVE,
+     * carga la DDL correspondiente, y arma el IpcRequest con el JSON de payload.
      *
-     * @param buffer    Raw bytes leídos desde $RECEIVE
-     * @param length    Cantidad de bytes válidos en el buffer
-     * @return          IpcRequest deserializado
-     * @throws DeserializationException si el buffer es inválido
+     * @param buffer     Bytes leídos de $RECEIVE
+     * @param len        Cantidad de bytes válidos
+     * @param ddlLoader  Loader de DDLs (con cache)
+     * @return           IpcRequest listo para pasarle a ApiGatewayClient
+     * @throws ParseException si faltan campos obligatorios (metodo/endpoint/ddl_json)
      */
-    public static IpcRequest deserialize(byte[] buffer, int length) throws DeserializationException {
-        if (length < REQ_OFFSET_PAYLOAD) {
-            throw new DeserializationException(
-                "Buffer demasiado corto: " + length + " bytes (mínimo " + REQ_OFFSET_PAYLOAD + ")");
+    public static IpcRequest parseBuffer(byte[] buffer, int len, DdlLoader ddlLoader)
+            throws ParseException {
+
+        String text = new String(buffer, 0, len, StandardCharsets.UTF_8);
+        Map<String, String> all = parseKeyValue(text);
+
+        // Los tres primeros campos son de control del servidor
+        String method   = requireField(all, "metodo").toUpperCase();
+        String endpoint = requireField(all, "endpoint");
+        String ddlName  = requireField(all, "ddl_json");
+        String corrId   = all.getOrDefault("correlation_id", generateCorrelationId());
+
+        // Campos de datos de negocio (todo lo que no es control)
+        Map<String, String> dataFields = new LinkedHashMap<>(all);
+        dataFields.remove("metodo");
+        dataFields.remove("endpoint");
+        dataFields.remove("ddl_json");
+        dataFields.remove("correlation_id");
+
+        // Cargar DDL y construir el JSON de payload para la API
+        DdlDefinition ddl         = ddlLoader.load(ddlName);
+        String        jsonPayload = buildRequestJson(dataFields, ddl);
+
+        return new IpcRequest(method, endpoint, ddlName, corrId, dataFields, jsonPayload, ddl);
+    }
+
+    /**
+     * Convierte el JSON de respuesta de la API externa a un buffer de longitud fija
+     * usando la sección "response" de la DDL del request original.
+     *
+     * El buffer resultante tiene los campos concatenados, cada uno padded a su longitud
+     * definida en el DDL (igual que una estructura COBOL de longitud fija).
+     *
+     * @param apiJsonResponse  Body JSON de la respuesta HTTP de la API
+     * @param request          IpcRequest original (contiene la DdlDefinition cargada)
+     * @return                 Buffer de bytes de longitud fija para enviar via REPLY
+     */
+    public static byte[] buildReplyBuffer(String apiJsonResponse, IpcRequest request) {
+        DdlDefinition ddl = request.getDdl();
+        StringBuilder sb  = new StringBuilder();
+
+        for (DdlField field : ddl.getResponseFields()) {
+            String rawValue = extractByJsonPath(apiJsonResponse, field.getJsonPath());
+            sb.append(padField(rawValue, field.getLength(), field.isNumeric()));
         }
 
-        ByteBuffer buf = ByteBuffer.wrap(buffer, 0, length)
-                                   .order(ByteOrder.BIG_ENDIAN);
+        return sb.toString().getBytes(StandardCharsets.UTF_8);
+    }
 
-        // Leer campos de header
-        short version = buf.getShort(REQ_OFFSET_VERSION);
-        if (version != 1) {
-            throw new DeserializationException("Versión de protocolo no soportada: " + version);
+    /**
+     * Construye un buffer de error usando la DDL si está disponible,
+     * o un formato mínimo de texto si la DDL no pudo cargarse.
+     *
+     * Convención de errores:
+     *   - Si la DDL tiene campo "cod_ret" → se llena con errorCode
+     *   - Si la DDL tiene campo "mensaje"  → se llena con errorMsg
+     *   - El resto de campos se ponen en blanco/cero
+     *
+     * @param errorCode  Código de error (ej: "9001", "ERR1")
+     * @param errorMsg   Descripción del error
+     * @param request    IpcRequest original (puede ser null si el error ocurrió antes del parseo)
+     */
+    public static byte[] buildErrorBuffer(String errorCode, String errorMsg, IpcRequest request) {
+        if (request == null || request.getDdl() == null) {
+            // Fallback sin DDL: buffer de texto libre
+            String text = padField(errorCode, 4, true) + padField(errorMsg, 200, false);
+            return text.getBytes(StandardCharsets.UTF_8);
         }
 
-        short msgType = buf.getShort(REQ_OFFSET_MSGTYPE);
+        // Construir un JSON de error mínimo que el buildReplyBuffer pueda procesar
+        String safeMsg = errorMsg != null ? errorMsg.replace("\"", "'") : "";
+        String errorJson = "{\"codigo\":" + toNumericOrZero(errorCode)
+            + ",\"codigo_str\":\"" + errorCode + "\""
+            + ",\"mensaje\":\"" + safeMsg + "\""
+            + ",\"data\":{}"
+            + ",\"cod_ret\":\"" + errorCode + "\""
+            + "}";
 
-        // Leer correlationId (ASCII fijo, strip padding de espacios/nulls)
-        String correlationId = readFixedString(buffer, REQ_OFFSET_CORRELATION, REQ_CORRELATION_LEN);
+        return buildReplyBuffer(errorJson, request);
+    }
 
-        // Leer operation path (ASCII fijo)
-        String operation = readFixedString(buffer, REQ_OFFSET_OPERATION, REQ_OPERATION_LEN);
+    // ----------------------------------------------------------
+    //  Parseo del buffer de texto plano
+    // ----------------------------------------------------------
 
-        // Leer payload (longitud + bytes UTF-8)
-        short payloadLen = buf.getShort(REQ_OFFSET_PAYLOAD_LEN);
-        String payload = "";
+    /**
+     * Convierte el texto key=value del buffer IPC en un mapa ordenado.
+     * Tolerante a espacios alrededor del '=' y a líneas vacías.
+     * Las claves se normalizan a minúsculas con underscores.
+     */
+    static Map<String, String> parseKeyValue(String text) throws ParseException {
+        if (text == null || text.isBlank()) {
+            throw new ParseException("Buffer IPC vacío");
+        }
+        Map<String, String> map = new LinkedHashMap<>();
+        String[] lines = text.split("\\r?\\n");
 
-        if (payloadLen > 0) {
-            if (REQ_OFFSET_PAYLOAD + payloadLen > length) {
-                throw new DeserializationException(
-                    "payloadLen=" + payloadLen + " excede el tamaño del buffer recibido=" + length);
+        for (String line : lines) {
+            line = line.trim();
+            if (line.isEmpty()) continue;
+            int eq = line.indexOf('=');
+            if (eq <= 0) continue;
+
+            String key = line.substring(0, eq).trim().toLowerCase().replace(" ", "_");
+            String val = line.substring(eq + 1).trim();
+            map.put(key, val);
+        }
+        return map;
+    }
+
+    // ----------------------------------------------------------
+    //  Construcción del JSON de request para la API
+    // ----------------------------------------------------------
+
+    /**
+     * Mapea los campos del buffer IPC (key=value) al JSON de la API usando
+     * el json_path de cada campo en la sección "request" de la DDL.
+     *
+     * Soporta json_path simples ("cuenta") y anidados ("documento.numero").
+     * Para anidados construye objetos JSON nested.
+     *
+     * Ejemplo:
+     *   DDL request: { field:"dni", json_path:"documento.numero" }
+     *   Buffer:      dni=20345678901
+     *   JSON:        { "documento": { "numero": "20345678901" } }
+     */
+    static String buildRequestJson(Map<String, String> dataFields, DdlDefinition ddl) {
+        // Árbol de valores: puede tener ramas para paths anidados
+        // Usamos un mapa de mapas para construir el JSON sin librería externa
+        Map<String, Object> root = new LinkedHashMap<>();
+
+        for (DdlField field : ddl.getRequestFields()) {
+            String rawValue = dataFields.getOrDefault(field.getName().toLowerCase(), "");
+            String jsonPath = field.getJsonPath();
+
+            if (jsonPath.contains(".")) {
+                setNestedValue(root, jsonPath.split("\\."), rawValue, field.isNumeric());
+            } else {
+                root.put(jsonPath, field.isNumeric()
+                    ? toNumericOrZero(rawValue)
+                    : rawValue);
             }
-            payload = new String(buffer, REQ_OFFSET_PAYLOAD, payloadLen, StandardCharsets.UTF_8);
         }
 
-        return new IpcRequest(version, msgType, correlationId, operation, payload);
+        return mapToJson(root);
     }
 
     // ----------------------------------------------------------
-    //  Serialización: IpcResponse → buffer binario
+    //  Extracción de valores del JSON de respuesta de la API
     // ----------------------------------------------------------
+
     /**
-     * Convierte un IpcResponse en el buffer binario que se envía
-     * de vuelta al proceso XPNET via Guardian REPLY.
+     * Extrae el valor de un campo JSON usando notación dot-path.
+     * Soporta objetos anidados: "data.saldo", "header.codigo".
+     * Para arrays no hay soporte (las DDLs actuales no los usan).
      *
-     * @param response  La respuesta a serializar
-     * @return          Buffer binario listo para REPLY
+     * Retorna string vacío si el path no existe en el JSON.
      */
-    public static byte[] serialize(IpcResponse response) {
-        byte[] correlationBytes = padOrTruncate(
-                response.getCorrelationId(), RES_CORRELATION_LEN);
+    static String extractByJsonPath(String json, String path) {
+        if (json == null || json.isEmpty() || path == null || path.isEmpty()) return "";
 
-        byte[] payloadBytes = response.getPayload() != null
-                ? response.getPayload().getBytes(StandardCharsets.UTF_8)
-                : new byte[0];
+        String[] parts = path.split("\\.");
+        String scope = json;
 
-        int totalSize = RES_HEADER_SIZE + payloadBytes.length;
-        ByteBuffer buf = ByteBuffer.allocate(totalSize)
-                                   .order(ByteOrder.BIG_ENDIAN);
+        // Navegar hasta el penúltimo segmento del path
+        for (int i = 0; i < parts.length - 1; i++) {
+            scope = extractJsonObject(scope, parts[i]);
+            if (scope == null) return "";
+        }
 
-        buf.putShort(response.getVersion());                    // [0..1]  version
-        buf.putShort((short) response.getHttpStatusCode());     // [2..3]  httpStatusCode
-        buf.putShort(response.getErrorCode());                  // [4..5]  errorCode
-        buf.put(correlationBytes);                              // [6..21] correlationId
-        buf.putShort((short) payloadBytes.length);              // [22..23] payloadLength
-        buf.put(payloadBytes);                                  // [24...] payload
-
-        return buf.array();
+        // Extraer el valor en el último segmento
+        return extractJsonScalar(scope, parts[parts.length - 1]);
     }
 
     // ----------------------------------------------------------
-    //  Utilidades internas
+    //  Padding de campos para el buffer de respuesta
     // ----------------------------------------------------------
 
     /**
-     * Lee una cadena ASCII de longitud fija desde un offset del buffer,
-     * eliminando caracteres de padding (null bytes y espacios).
+     * Aplica el padding de longitud fija al valor de un campo.
+     *
+     * string:  "Juan      " — alineado izquierda, espacios a la derecha
+     * numeric: "0000001500" — alineado derecha, ceros a la izquierda
+     *
+     * Si el valor es más largo que length, se trunca desde la derecha.
      */
-    private static String readFixedString(byte[] buffer, int offset, int length) {
-        byte[] fieldBytes = Arrays.copyOfRange(buffer, offset, offset + length);
-        // Trim null bytes y espacios (padding NonStop típico)
-        int end = length;
-        while (end > 0 && (fieldBytes[end - 1] == 0x00 || fieldBytes[end - 1] == 0x20)) {
-            end--;
+    static String padField(String value, int length, boolean numeric) {
+        if (value == null) value = "";
+        // Truncar si excede la longitud del campo DDL
+        if (value.length() > length) value = value.substring(0, length);
+
+        int padding = length - value.length();
+
+        if (numeric) {
+            // Alineado a la derecha con ceros
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < padding; i++) sb.append('0');
+            sb.append(value);
+            return sb.toString();
+        } else {
+            // Alineado a la izquierda con espacios
+            StringBuilder sb = new StringBuilder(value);
+            for (int i = 0; i < padding; i++) sb.append(' ');
+            return sb.toString();
         }
-        return new String(fieldBytes, 0, end, StandardCharsets.US_ASCII);
+    }
+
+    // ----------------------------------------------------------
+    //  Helpers internos
+    // ----------------------------------------------------------
+
+    private static String requireField(Map<String, String> fields, String name)
+            throws ParseException {
+        String value = fields.get(name);
+        if (value == null || value.isEmpty()) {
+            throw new ParseException(
+                "Campo obligatorio ausente en buffer IPC: '" + name + "'. "
+                + "El buffer debe comenzar con: metodo=, endpoint=, ddl_json=");
+        }
+        return value;
+    }
+
+    private static String generateCorrelationId() {
+        return "CID" + Long.toHexString(System.currentTimeMillis()).toUpperCase();
+    }
+
+    /** Extrae el valor escalar (string o número) de una clave en el scope JSON dado. */
+    private static String extractJsonScalar(String json, String key) {
+        // Primero intentar valor string: "key": "value"
+        Pattern strPat = Pattern.compile(
+            "\"" + Pattern.quote(key) + "\"\\s*:\\s*\"([^\"]*)\"");
+        Matcher m = strPat.matcher(json);
+        if (m.find()) return m.group(1);
+
+        // Luego intentar valor numérico/boolean: "key": 123 | true | false | null
+        Pattern numPat = Pattern.compile(
+            "\"" + Pattern.quote(key) + "\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?|true|false|null)");
+        m = numPat.matcher(json);
+        if (m.find()) {
+            String val = m.group(1);
+            return "null".equals(val) ? "" : val;
+        }
+
+        return "";
+    }
+
+    /** Extrae el contenido del objeto JSON identificado por key en el scope. */
+    private static String extractJsonObject(String json, String key) {
+        Pattern p = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*(\\{)");
+        Matcher m = p.matcher(json);
+        if (!m.find()) return null;
+
+        int start = m.start(1);
+        int depth = 0;
+        for (int i = start; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if      (c == '{') depth++;
+            else if (c == '}') { depth--; if (depth == 0) return json.substring(start, i + 1); }
+        }
+        return null;
     }
 
     /**
-     * Convierte un string a bytes de longitud fija, con padding de null bytes
-     * si es más corto, o truncado si es más largo.
+     * Inserta un valor en un mapa anidado usando un path de segmentos.
+     * Crea los nodos intermedios (mapas) si no existen.
      */
-    private static byte[] padOrTruncate(String value, int length) {
-        byte[] result = new byte[length]; // inicializado en 0x00
-        if (value != null) {
-            byte[] src = value.getBytes(StandardCharsets.US_ASCII);
-            System.arraycopy(src, 0, result, 0, Math.min(src.length, length));
+    @SuppressWarnings("unchecked")
+    private static void setNestedValue(Map<String, Object> node, String[] pathSegments,
+                                        String value, boolean numeric) {
+        for (int i = 0; i < pathSegments.length - 1; i++) {
+            node = (Map<String, Object>) node.computeIfAbsent(
+                pathSegments[i], k -> new LinkedHashMap<String, Object>());
         }
-        return result;
+        String leafKey = pathSegments[pathSegments.length - 1];
+        node.put(leafKey, numeric ? toNumericOrZero(value) : value);
+    }
+
+    /** Convierte un mapa (potencialmente anidado) a JSON string sin librería externa. */
+    @SuppressWarnings("unchecked")
+    private static String mapToJson(Map<String, Object> map) {
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, Object> entry : map.entrySet()) {
+            if (!first) sb.append(",");
+            sb.append("\"").append(entry.getKey()).append("\":");
+
+            Object val = entry.getValue();
+            if (val instanceof Map) {
+                sb.append(mapToJson((Map<String, Object>) val));
+            } else if (val instanceof String) {
+                sb.append("\"").append(((String) val).replace("\\", "\\\\")
+                    .replace("\"", "\\\"")).append("\"");
+            } else {
+                sb.append(val); // numeric value stored as String of digits
+            }
+            first = false;
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    /** Convierte un string a valor numérico o "0" si no es válido. */
+    private static String toNumericOrZero(String value) {
+        if (value == null || value.isBlank()) return "0";
+        String stripped = value.trim().replaceAll("[^0-9.\\-]", "");
+        return stripped.isEmpty() ? "0" : stripped;
     }
 
     // ----------------------------------------------------------
-    //  Excepción de deserialización
+    //  Excepción de parseo del buffer IPC
     // ----------------------------------------------------------
-    public static class DeserializationException extends Exception {
-        public DeserializationException(String message) {
-            super(message);
-        }
+
+    public static class ParseException extends Exception {
+        public ParseException(String message) { super(message); }
     }
 }

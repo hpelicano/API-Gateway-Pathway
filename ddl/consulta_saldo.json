@@ -1,0 +1,17 @@
+{
+  "ddl_name":    "consulta_saldo",
+  "description": "Consulta de saldo de cuenta corriente / caja de ahorro",
+
+  "request": [
+    { "field": "cuenta",  "length": 16, "type": "string",  "json_path": "cuenta"       },
+    { "field": "moneda",  "length":  3, "type": "string",  "json_path": "moneda"        },
+    { "field": "tipo",    "length":  2, "type": "string",  "json_path": "tipo_cuenta"   }
+  ],
+
+  "response": [
+    { "field": "cod_ret", "length":  4, "type": "numeric", "json_path": "codigo"        },
+    { "field": "saldo",   "length": 15, "type": "numeric", "json_path": "data.saldo"    },
+    { "field": "estado",  "length":  2, "type": "string",  "json_path": "data.estado"   },
+    { "field": "mensaje", "length": 80, "type": "string",  "json_path": "mensaje"       }
+  ]
+}
